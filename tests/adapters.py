@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
+from cs336_basics.tokenizer import SimpleBPETokenizer
 from jaxtyping import Float, Int
 
 import numpy.typing as npt
@@ -559,21 +560,6 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    # TODO - Learn about tokenizers and upgrade this 
-    class SimpleBPETokenizer:
-        def __init__(self, vocab, merges, special_tokens=None):
-            self.vocab = vocab
-            self.merges = merges
-            self.special_tokens = special_tokens or []
-
-        def encode(self, text):
-            # Dummy: just return list of token ids for each byte in text if present in vocab
-            return [k for k, v in self.vocab.items() if v in text.encode()]
-
-        def decode(self, token_ids):
-            # Dummy: just join bytes from vocab
-            return b"".join([self.vocab[i] for i in token_ids if i in self.vocab]).decode(errors="ignore")
-
     return SimpleBPETokenizer(vocab, merges, special_tokens)
 
 
