@@ -306,7 +306,43 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    # RMSNorm 1 (pre-norm)
+    x_norm1 = run_rmsnorm(d_model, 1e-5, weights["ln1.weight"], in_features)
+
+    # Prepare token positions for RoPE
+    batch_size, seq_len, _ = x_norm1.shape
+    device = x_norm1.device
+    token_positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
+
+    # Multi-head self-attention with RoPE
+    attn_out = run_multihead_self_attention_with_rope(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        q_proj_weight=weights["attn.q_proj.weight"],
+        k_proj_weight=weights["attn.k_proj.weight"],
+        v_proj_weight=weights["attn.v_proj.weight"],
+        o_proj_weight=weights["attn.output_proj.weight"],
+        in_features=x_norm1,
+        token_positions=token_positions,
+    )
+    x = in_features + attn_out
+
+    # RMSNorm 2 (pre-norm)
+    x_norm2 = run_rmsnorm(d_model, 1e-5, weights["ln2.weight"], x)
+
+    # SwiGLU FFN
+    ffn_out = run_swiglu(
+        d_model=d_model,
+        d_ff=d_ff,
+        w1_weight=weights["ffn.w1.weight"],
+        w2_weight=weights["ffn.w2.weight"],
+        w3_weight=weights["ffn.w3.weight"],
+        in_features=x_norm2,
+    )
+    out = x + ffn_out
+    return out
 
 
 def run_transformer_lm(
@@ -433,7 +469,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise 
+    # Compute RMSNorm: x * weight / sqrt(mean(x^2) + eps)
+    norm = in_features.norm(dim=-1, keepdim=True) / (d_model ** 0.5)
+    x_normed = in_features / (norm + eps)
+    return x_normed * weights
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -497,7 +536,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return torch.softmax(in_features, dim=dim)
 
 
 def run_cross_entropy(
@@ -515,7 +554,10 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    # inputs: (batch_size, vocab_size), targets: (batch_size,)
+    log_probs = torch.log_softmax(inputs, dim=1)
+    loss = -log_probs[torch.arange(inputs.shape[0]), targets].mean()
+    return loss
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -527,7 +569,20 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    parameters = list(parameters)
+    total_norm = torch.norm(
+        torch.stack([
+            p.grad.detach().norm(2)
+            for p in parameters
+            if p.grad is not None
+        ]),
+        2
+    )
+    clip_coef = max_l2_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for p in parameters:
+            if p.grad is not None:
+                p.grad.detach().mul_(clip_coef)
 
 
 def get_adamw_cls() -> Any:
@@ -563,7 +618,17 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    if it < warmup_iters:
+        # Linear warmup
+        lr = max_learning_rate * it / warmup_iters
+    elif it < warmup_iters + cosine_cycle_iters:
+        # Cosine annealing
+        progress = (it - warmup_iters) / cosine_cycle_iters
+        cosine_decay = 0.5 * (1 + torch.cos(torch.tensor(progress * 3.141592653589793)))
+        lr = min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_decay.item()
+    else:
+        lr = min_learning_rate
+    return lr
 
 
 def run_save_checkpoint(
@@ -582,7 +647,14 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "iteration": iteration,
+        },
+        out,
+    )
 
 
 def run_load_checkpoint(
@@ -603,7 +675,11 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return checkpoint["iteration"]
+
 
 
 def get_tokenizer(
