@@ -211,7 +211,38 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    batch_size, seq_len, d_in = in_features.shape
+    d_k = q_proj_weight.shape[0] // num_heads
+    d_v = v_proj_weight.shape[0] // num_heads
+
+    # Project input to Q, K, V for all heads at once
+    Q = torch.matmul(in_features, q_proj_weight.t())
+    K = torch.matmul(in_features, k_proj_weight.t())
+    V = torch.matmul(in_features, v_proj_weight.t())
+
+    # Reshape to (batch, seq_len, num_heads, d_k/d_v) then transpose to (batch, num_heads, seq_len, d_k/d_v)
+    Q = Q.view(batch_size, seq_len, num_heads, d_k).transpose(1, 2)
+    K = K.view(batch_size, seq_len, num_heads, d_k).transpose(1, 2)
+    V = V.view(batch_size, seq_len, num_heads, d_v).transpose(1, 2)
+
+    # Apply RoPE to Q and K
+    if token_positions is None:
+        token_positions = torch.arange(seq_len, device=in_features.device).unsqueeze(0).expand(batch_size, seq_len)
+    # Expand token_positions for each head
+    token_positions_expanded = token_positions.unsqueeze(1).expand(batch_size, num_heads, seq_len)
+
+    Q = run_rope(d_k, theta, max_seq_len, Q, token_positions_expanded)
+    K = run_rope(d_k, theta, max_seq_len, K, token_positions_expanded)
+
+    # Scaled dot-product attention
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k ** 0.5)
+    attn = torch.softmax(scores, dim=-1)
+    context = torch.matmul(attn, V)  # (batch, num_heads, seq_len, d_v)
+
+    # Concatenate heads and project out
+    context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * d_v)
+    output = torch.matmul(context, o_proj_weight.t())
+    return output
 
 
 def run_rope(
@@ -233,8 +264,40 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    # Compute the rotary positional embeddings
+    # in_query_or_key: (..., sequence_length, d_k)
+    # token_positions: (..., sequence_length)
+    # We'll apply RoPE to the last dimension (d_k), which must be even
 
+    half_d = d_k // 2
+    seq_shape = in_query_or_key.shape[:-1]
+    device = in_query_or_key.device
+
+    # Compute the frequencies
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half_d, device=device).float() / half_d))
+    # token_positions: (..., sequence_length)
+    pos = token_positions.float()
+    # shape: (..., sequence_length, half_d)
+    freqs = pos.unsqueeze(-1) * inv_freq
+
+    # Compute cos and sin
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+
+    # Prepare input for rotation
+    x1 = in_query_or_key[..., :half_d]
+    x2 = in_query_or_key[..., half_d:2*half_d]
+
+    # Apply rotation
+    rotated_x1 = x1 * cos - x2 * sin
+    rotated_x2 = x1 * sin + x2 * cos
+
+    # Concatenate rotated and (if odd d_k) untouched part
+    if d_k % 2 == 0:
+        out = torch.cat([rotated_x1, rotated_x2], dim=-1)
+    else:
+        out = torch.cat([rotated_x1, rotated_x2, in_query_or_key[..., 2*half_d:]], dim=-1)
+    return out
 
 def run_transformer_block(
     d_model: int,
@@ -732,4 +795,17 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # Read the input corpus
+    with open(input_path, "rb") as f:
+        data = f.read()
+
+    # Initialize the tokenizer and train
+    tokenizer = SimpleBPETokenizer.train(
+        data,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        **kwargs,
+    )
+
+    # Return vocab and merges
+    return tokenizer.vocab, tokenizer.merges
